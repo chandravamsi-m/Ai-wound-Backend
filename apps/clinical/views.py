@@ -58,7 +58,9 @@ class PatientViewSet(viewsets.ModelViewSet):
                     'is_resolved': False
                 }
                 FirestoreService.create_document('alerts', alert_data)
-            return FirestoreService.collection('patients').stream()
+            
+            docs = FirestoreService.collection('patients').stream()
+            return [doc.to_dict() | {'id': doc.id} for doc in docs]
 
         # Nurses see patients assigned to them via tasks by default
         if user.role == 'Nurse':
