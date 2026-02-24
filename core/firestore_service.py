@@ -10,10 +10,11 @@ class FirestoreService:
     def get_db(cls):
         if cls._db is None:
             # Initialize Firebase Admin SDK
-            cred_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
-            if not cred_path:
-                # Fallback to a default name in the Backend directory if not in .env
-                cred_path = os.path.join(settings.BASE_DIR, 'firebase-service-account.json')
+            cred_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH', 'firebase-service-account.json')
+            
+            # If path is relative, make it absolute relative to BASE_DIR
+            if not os.path.isabs(cred_path):
+                cred_path = os.path.join(settings.BASE_DIR, cred_path)
             
             if not os.path.exists(cred_path):
                 raise FileNotFoundError(f"Firebase service account file not found at {cred_path}")

@@ -12,4 +12,4 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: FIREBASE_SERVICE_ACCOUNT_PATH
-        value: secret-files/firebase-service-account.json
+        value: firebase-service-account.json
