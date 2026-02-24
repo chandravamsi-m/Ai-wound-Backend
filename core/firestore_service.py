@@ -58,6 +58,24 @@ class FirestoreService:
         cls.collection(collection_name).document(str(doc_id)).delete()
 
     @classmethod
-    def query(cls, collection_name, field, operator, value):
-        docs = cls.collection(collection_name).where(field, operator, value).stream()
+    def query(cls, collection_name, field, operator, value, limit=None):
+        query = cls.collection(collection_name).where(field, operator, value)
+        if limit:
+            query = query.limit(limit)
+        docs = query.stream()
         return [doc.to_dict() | {'id': doc.id} for doc in docs]
+
+    @classmethod
+    def count(cls, collection_name, filters=None):
+        """
+        Efficiently count documents using Firestore Aggregation (Count).
+        filters: list of tuples (field, operator, value)
+        """
+        query = cls.collection(collection_name)
+        if filters:
+            for field, op, val in filters:
+                query = query.where(field, op, val)
+        
+        # Using aggregation query for near-zero read cost
+        results = query.count().get()
+        return results[0][0].value

@@ -48,4 +48,4 @@ staticfiles/
 .DS_Store
 Thumbs.db
 
-ai-based-wound-analysis-tool-firebase-adminsdk-fbsvc-f19c554619.json
+firebase-service-account.json

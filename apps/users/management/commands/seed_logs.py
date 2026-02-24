@@ -1,107 +1,60 @@
-import os
-import sys
-import django
-from datetime import datetime, timedelta
-import random
-
-# Add parent directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'wound_analysis_backend.settings')
-django.setup()
-
+from django.core.management.base import BaseCommand
 from users.models import User, SystemLog
+from core.firestore_service import FirestoreService
+from django.utils import timezone
+from datetime import datetime, timedelta
 
-def seed_logs():
-    # Clear existing logs
-    SystemLog.objects.all().delete()
-    
-    # Get some users
-    users = list(User.objects.all())
-    admin = User.objects.filter(role='Admin').first()
-    doctor = User.objects.filter(role='Doctor').first()
-    
-    # Sample IP addresses
-    sample_ips = [
-        '192.168.1.104',
-        '45.22.100.12',
-        '10.0.0.42',
-        '192.168.1.55',
-        None  # For system-generated logs
-    ]
-    
-    # Sample log data
-    logs_data = [
-        {
-            "user": admin,
-            "action": "Updated user permissions for 'nurse_jade'",
-            "severity": "Info",
-            "ip_address": "192.168.1.104",
-            "hours_ago": 2
-        },
-        {
-            "user": doctor,
-            "action": "Failed login attempt (3x)",
-            "severity": "Warning",
-            "ip_address": "45.22.100.12",
-            "hours_ago": 4
-        },
-        {
-            "user": None,
-            "action": "Daily database backup completed",
-            "severity": "Success",
-            "ip_address": None,
-            "hours_ago": 24
-        },
-        {
-            "user": None,
-            "action": "Critical: High latency detected in API Gateway",
-            "severity": "Error",
-            "ip_address": "10.0.0.42",
-            "hours_ago": 36
-        },
-        {
-            "user": admin,
-            "action": "Exported patient record summary (MRN: 8821)",
-            "severity": "Info",
-            "ip_address": "192.168.1.55",
-            "hours_ago": 48
-        },
-        {
-            "user": doctor,
-            "action": "Accessed patient medical records",
-            "severity": "Info",
-            "ip_address": "192.168.1.104",
-            "hours_ago": 6
-        },
-        {
-            "user": None,
-            "action": "System maintenance scheduled",
-            "severity": "Info",
-            "ip_address": None,
-            "hours_ago": 12
-        },
-        {
-            "user": admin,
-            "action": "User account created: new_nurse",
-            "severity": "Success",
-            "ip_address": "192.168.1.104",
-            "hours_ago": 18
-        }
-    ]
-    
-    for item in logs_data:
-        log = SystemLog.objects.create(
-            user=item['user'],
-            action=item['action'],
-            severity=item['severity'],
-            ip_address=item['ip_address']
-        )
-        # Override auto_now_add timestamp for historical data
-        log.timestamp = datetime.now() - timedelta(hours=item['hours_ago'])
-        log.save()
+class Command(BaseCommand):
+    help = 'Seeds initial logs to both Local SQLite and Firestore'
+
+    def handle(self, *args, **options):
+        # Clear existing logs locally for a fresh start
+        SystemLog.objects.all().delete()
         
-    print(f"Successfully seeded {len(logs_data)} system logs.")
-
-if __name__ == '__main__':
-    seed_logs()
+        # Get users for attribution
+        admin = User.objects.filter(role='Admin').first()
+        doctor = User.objects.filter(role='Doctor').first()
+        nurse = User.objects.filter(role='Nurse').first()
+        
+        # Sample log data
+        logs_data = [
+            {"user": admin, "action": "ADMIN_LOGIN_SUCCESS: Authorized access to panel", "severity": "Success", "hours_ago": 1},
+            {"user": doctor, "action": "WOUND_ANALYSIS: Processed scan for Patient ID: PAT-101", "severity": "Info", "hours_ago": 2},
+            {"user": nurse, "action": "PATIENT_INTAKE: Admitted new patient 'John Doe'", "severity": "Success", "hours_ago": 5},
+            {"user": None, "action": "SYSTEM_CRON: Automated database optimization", "severity": "Info", "hours_ago": 12},
+            {"user": admin, "action": "SECURITY_WARNING: Multiple failed login attempts from 45.22.100.12", "severity": "Warning", "hours_ago": 24},
+            {"user": doctor, "action": "CRITICAL_ESCALATION: Stage 4 Pressure Injury detected", "severity": "Error", "hours_ago": 48},
+        ]
+        
+        for item in logs_data:
+            user = item['user']
+            timestamp = timezone.now() - timedelta(hours=item['hours_ago'])
+            
+            # 1. Create locally (for history)
+            log = SystemLog.objects.create(
+                user=user,
+                action=item['action'],
+                severity=item['severity'],
+                ip_address="127.0.0.1" if user else None
+            )
+            # Override auto-add timestamp
+            log.timestamp = timestamp
+            log.save()
+            
+            # 2. Sync to Firestore (Crucial for the new project)
+            firestore_data = {
+                'id': str(log.id),
+                'user_id': user.id if user else None,
+                'user_email': user.email if user else 'system@mediwound.ai',
+                'action': item['action'],
+                'severity': item['severity'],
+                'ip_address': log.ip_address,
+                'timestamp': timestamp.isoformat()
+            }
+            
+            # The 'logs' viewset uses auto-generated IDs from Firestore typically
+            FirestoreService.create_document('logs', firestore_data)
+            
+            self.stdout.write(self.style.SUCCESS(f"Logged action: {item['action']}"))
+            
+        self.stdout.write(self.style.SUCCESS(f"Successfully seeded {len(logs_data)} logs to SQLite and Firestore."))

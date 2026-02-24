@@ -19,13 +19,20 @@ from django.contrib.auth.hashers import check_password
 
 class UserViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
+    lookup_value_regex = '[^/]+'
 
     def list(self, request):
-        users_docs = FirestoreService.collection('users').stream()
+        role = request.query_params.get('role')
+        limit = int(request.query_params.get('limit', 12))
+        
+        query = FirestoreService.collection('users')
+        if role:
+            query = query.where('role', '==', role)
+            
+        users_docs = query.limit(limit).stream()
         users = []
         for doc in users_docs:
             user_data = doc.to_dict() | {'id': doc.id}
-            # Use the dedicated last_activity field from the user document
             user_data['activity'] = format_activity_status(user_data.get('last_activity'))
             users.append(user_data)
             
@@ -143,54 +150,96 @@ class SystemLogViewSet(viewsets.ViewSet):
     permission_classes = [IsAdminOrDoctor]
     
     def list(self, request):
-        docs = FirestoreService.collection('logs').order_by('timestamp', direction='DESCENDING').limit(150).stream()
-        logs_list = []
-        user_cache = {} # N+1 fix: Cache user details
-        
-        for doc in docs:
-            log_data = doc.to_dict() | {'id': doc.id}
+        try:
+            query = FirestoreService.collection('logs')
             
-            # Enrich with user display name (Prefer Email as requested)
-            u_id = log_data.get('user_id')
-            u_email = log_data.get('user_email')
+            # 1. Firestore-level filtering (Only Dates - avoids composite index requirements)
+            start_date = request.query_params.get('start_date')
+            if start_date:
+                query = query.where('timestamp', '>=', start_date)
+                
+            end_date = request.query_params.get('end_date')
+            if end_date:
+                if 'T' not in end_date:
+                    end_date = f"{end_date}T23:59:59"
+                query = query.where('timestamp', '<=', end_date)
+
+            # Execute query sorted by time
+            # Extreme Read Reduction: Default limit strictly 15 docs
+            limit = int(request.query_params.get('limit', 15))
+            docs = query.order_by('timestamp', direction='DESCENDING').limit(limit).stream()
             
-            if not u_id:
-                log_data['user_name'] = 'System'
-            elif u_email:
-                # Use the stored email directly (very fast)
-                log_data['user_name'] = u_email
-            elif u_id in user_cache:
-                log_data['user_name'] = user_cache[u_id]
-            else:
-                user_doc = FirestoreService.get_document('users', u_id)
-                # Fallback to email if name is missing, else 'System'
-                display_name = user_doc.get('email', user_doc.get('name', 'System')) if user_doc else 'System'
-                user_cache[u_id] = display_name
-                log_data['user_name'] = display_name
+            severity_filter = request.query_params.get('severity')
+            search = request.query_params.get('search', '').lower()
             
-            logs_list.append(log_data)
+            logs_list = []
+            user_cache = {}
             
-        return Response(logs_list)
+            for doc in docs:
+                log_data = doc.to_dict() | {'id': doc.id}
+                
+                # 2. Severity Filtering (In-Memory to avoid index issues)
+                if severity_filter and severity_filter != 'All Severities':
+                    if log_data.get('severity') != severity_filter:
+                        continue
+                
+                # 3. Enrich with user name
+                # Optimization: Prioritize user_email already saved in the log to avoid N+1 lookups
+                u_email = log_data.get('user_email')
+                u_id = log_data.get('user_id')
+                
+                if u_email:
+                    u_name = u_email
+                elif not u_id:
+                    u_name = 'System'
+                elif u_id in user_cache:
+                    u_name = user_cache[u_id]
+                else:
+                    # Fallback lookup (rarely needed if logs are healthy)
+                    user_doc = FirestoreService.get_document('users', u_id)
+                    u_name = user_doc.get('email', user_doc.get('name', 'System')) if user_doc else 'System'
+                    user_cache[u_id] = u_name
+                
+                log_data['user_name'] = u_name
+                
+                # 4. Search Filtering (Action, User, IP)
+                if search:
+                    action = str(log_data.get('action') or '').lower()
+                    ip = str(log_data.get('ip_address') or '').lower()
+                    u_name_lower = str(u_name or '').lower()
+                    if search not in action and search not in u_name_lower and search not in ip:
+                        continue
+
+                logs_list.append(log_data)
+                
+            return Response(logs_list)
+        except Exception as e:
+            import traceback
+            error_msg = f"Error in SystemLogs: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            return Response({
+                "error": error_msg,
+                "detail": str(e),
+                "hint": "This often happens if a composite index is missing in Firestore."
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class DashboardSummaryView(APIView):
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
         try:
-            # Firestore count aggregation (for small datasets, stream() is fine, for large use aggregation queries)
-            users_docs = FirestoreService.collection('users').where('isActive', '==', True).stream()
-            active_users = sum(1 for _ in users_docs)
+            # Firestore count aggregation - Use COUNT() for near-zero quota cost
+            active_users = FirestoreService.count('users', [('isActive', '==', True)])
+            total_logs = FirestoreService.count('logs')
+            clinical_alerts = FirestoreService.count('alerts', [('is_dismissed', '==', False)])
             
-            logs_docs = FirestoreService.collection('logs').stream()
-            total_logs = sum(1 for _ in logs_docs)
+            # Use 'in' filter correctly with count() if supported, else just use individual counts if needed
+            # For now, security alerts (Logs with Error/Warning)
+            # Firestore's count() works on any query
+            security_alerts = FirestoreService.count('logs', [('severity', 'in', ['Error', 'Warning'])])
             
-            alerts_docs = FirestoreService.collection('alerts').where('is_dismissed', '==', False).stream()
-            clinical_alerts = sum(1 for _ in alerts_docs)
-            
-            sec_alerts_docs = FirestoreService.collection('logs').where('severity', 'in', ['Error', 'Warning']).stream()
-            security_alerts = sum(1 for _ in sec_alerts_docs)
-            
-            display_alerts = clinical_alerts + security_alerts
+            display_alerts = clinical_alerts 
             
             security_status = "Healthy"
             if security_alerts > 10:
@@ -198,15 +247,10 @@ class DashboardSummaryView(APIView):
             elif security_alerts > 0:
                 security_status = "Action Required"
 
-            # Real document counts for storage estimation
-            patients_all = FirestoreService.collection('patients').stream()
-            patient_count = sum(1 for _ in patients_all)
-            
-            assessments_all = FirestoreService.collection('assessments').stream()
-            assessment_count = sum(1 for _ in assessments_all)
-            
-            logs_all = FirestoreService.collection('logs').stream()
-            logs_count = sum(1 for _ in logs_all)
+            # Storage Metrics counts
+            patient_count = FirestoreService.count('patients')
+            assessment_count = FirestoreService.count('assessments')
+            logs_count = total_logs # Use the count we already fetched
             
             # Estimating Firestore usage (Wound images are the main bulk)
             # Average assessment with base64 image: ~200KB
@@ -253,10 +297,10 @@ class StorageStatsView(APIView):
     def get(self, request):
         metrics = get_storage_metrics()
         
-        # Get real counts for breakdown
-        patient_count = sum(1 for _ in FirestoreService.collection('patients').stream())
-        assessment_count = sum(1 for _ in FirestoreService.collection('assessments').stream())
-        logs_count = sum(1 for _ in FirestoreService.collection('logs').stream())
+        # Get real counts for breakdown - Use COUNT() for near-zero quota cost
+        patient_count = FirestoreService.count('patients')
+        assessment_count = FirestoreService.count('assessments')
+        logs_count = FirestoreService.count('logs')
         
         est_pat_mb = (patient_count * 1) / 1024
         est_img_mb = (assessment_count * 200) / 1024
