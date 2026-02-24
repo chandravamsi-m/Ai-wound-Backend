@@ -1,0 +1,18 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 🛡️ SECURITY LOCKDOWN 🛡️
+    //
+    // These rules deny ALL direct access from the web/mobile SDKs.
+    // Our Django Backend uses a Service Account, which has administrator
+    // privileges and bypasses these rules completely.
+    //
+    // This architecture (Backend-as-Proxy) keeps your database private 
+    // even if someone finds your Firebase Project ID.
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
