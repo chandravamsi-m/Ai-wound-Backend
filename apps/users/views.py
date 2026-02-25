@@ -64,12 +64,26 @@ class UserViewSet(viewsets.ViewSet):
             if 'isActive' not in data:
                 data['isActive'] = (data.get('status') == 'ACTIVE')
             
+            email = data.get('email')
+            if not email:
+                return Response({"error": "Email is required for user creation."}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # 1. Duplicate Protection: Check if user already exists in Firestore
+            existing_user = FirestoreService.get_document('users', email)
+            if existing_user:
+                return Response({
+                    "error": "A user with this email already exists in Firestore.",
+                    "detail": "Duplicate identity prevented. If this is a legacy account, delete it before recreating."
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
             data['created_at'] = timezone.now().isoformat()
-            user_id = FirestoreService.create_document('users', data)
+            
+            # 2. Force Email as Document ID
+            user_id = FirestoreService.create_document('users', data, doc_id=email)
             
             log_system_event(
                 user=request.user,
-                action=f"ADMIN_USER_CREATE: User {user_id} ({data.get('email')}) created with role {data.get('role')}",
+                action=f"ADMIN_USER_CREATE: User {email} created with role {data.get('role')}",
                 severity='Success',
                 ip_address=get_client_ip(request)
             )
