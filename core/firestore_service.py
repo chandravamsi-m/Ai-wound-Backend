@@ -13,11 +13,19 @@ class FirestoreService:
             cred_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH', 'firebase-service-account.json')
             
             # If path is relative, make it absolute relative to BASE_DIR
-            if not os.path.isabs(cred_path):
-                cred_path = os.path.join(settings.BASE_DIR, cred_path)
+            full_path = cred_path
+            if not os.path.isabs(full_path):
+                full_path = os.path.join(settings.BASE_DIR, full_path)
             
-            if not os.path.exists(cred_path):
-                raise FileNotFoundError(f"Firebase service account file not found at {cred_path}")
+            # Resilience Check: If the env-specified file is missing, fallback to hardcoded default
+            if not os.path.exists(full_path):
+                fallback_path = os.path.join(settings.BASE_DIR, 'firebase-service-account.json')
+                if os.path.exists(fallback_path) and full_path != fallback_path:
+                    full_path = fallback_path
+                else:
+                    raise FileNotFoundError(f"Firebase service account file not found at {full_path}")
+            
+            cred_path = full_path
 
             if not firebase_admin._apps:
                 cred = credentials.Certificate(cred_path)

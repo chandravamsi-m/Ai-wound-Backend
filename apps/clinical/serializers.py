@@ -40,6 +40,8 @@ class PatientSerializer(serializers.ModelSerializer):
     clinical_history = ClinicalRecordSerializer(source='clinical_records', many=True, read_only=True)
     wounds = WoundSerializer(many=True, read_only=True)
     physician_name = serializers.ReadOnlyField(source='assigned_physician.name')
+    admission_date = serializers.DateTimeField(required=False, allow_null=True, input_formats=["%Y-%m-%d", "iso-8601"])
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
     
     class Meta:
         model = Patient
@@ -47,7 +49,7 @@ class PatientSerializer(serializers.ModelSerializer):
             'id', 'name', 'mrn', 'age', 'gender', 'date_of_birth', 
             'bed', 'ward', 'assigned_physician', 'physician_name', 
             'diagnosis', 'medical_history', 'admission_date', 
-            'clinical_history', 'wounds'
+            'status', 'clinical_history', 'wounds'
         ]
         read_only_fields = ['id', 'mrn']
 

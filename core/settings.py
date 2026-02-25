@@ -15,8 +15,8 @@ import os
 from dotenv import load_dotenv
 from datetime import timedelta
 
-# Load .env file
-load_dotenv()
+# Load .env file with override to ensure local changes take precedence
+load_dotenv(override=True)
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent

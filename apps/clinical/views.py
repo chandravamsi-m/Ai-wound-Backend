@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Count, Avg, Q
 from django.utils import timezone
-from datetime import timedelta
+from datetime import timedelta, datetime
 from .models import Patient, Alert, Wound, WoundAssessment, Task, ClinicalRecord
 from .serializers import (
     PatientSerializer, AlertSerializer, WoundAssessmentSerializer, 
@@ -14,6 +14,29 @@ from core.firestore_service import FirestoreService
 import random, base64, io
 from PIL import Image
 import core.simple_cache as cache
+
+# --- Internal Helpers ---
+def _parse_iso_datetime(iso_str):
+    try:
+        return datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+    except:
+        return None
+
+def _normalize_datetime_iso(iso_str):
+    if not iso_str:
+        return 'N/A', None
+    try:
+        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        return dt.isoformat(), dt
+    except:
+        return 'N/A', None
+
+def _derive_assessment_status(stage, is_escalated):
+    if is_escalated:
+        return {'status': 'Deteriorating', 'status_color': '#ef4444', 'status_bg': '#fef2f2'}
+    if stage == 'Stage 1':
+        return {'status': 'Healing', 'status_color': '#10b981', 'status_bg': '#ecfdf5'}
+    return {'status': 'Stationary', 'status_color': '#f59e0b', 'status_bg': '#fffbe6'}
 
 # --- Shared Viewsets ---
 
@@ -29,43 +52,24 @@ class PatientViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             return []
             
-        # For Firestore, we don't return a Django QuerySet. 
-        # This will require updating the serializer or returning raw data.
-        # For the sake of this migration, we will fetch data from Firestore.
+        limit = int(self.request.query_params.get('limit', 20))
         
-        limit = int(self.request.query_params.get('limit', 20)) # Reduced default from 100 to 20
-        
-        if self.request.query_params.get('all') == 'true':
-            # Security Audit: Log if a Nurse accesses the full registry (Break-the-Glass)
-            if hasattr(user, 'role') and user.role == 'Nurse':
-                from users.utils import log_system_event, get_client_ip
-                log_system_event(
-                    user=user,
-                    action="Accessed Global Patient Registry (Break-the-Glass Protocol)",
-                    severity='Warning',
-                    ip_address=get_client_ip(self.request)
-                )
-                
-                # Create a formal Security Alert
-                alert_data = {
-                    'patient_id': 'SYSTEM',
-                    'triggered_by_id': user.id,
-                    'patient_name': 'Global Registry',
-                    'alert_type': "Security Violation",
-                    'description': f"Nurse {user.email} triggered Break-the-Glass protocol for global access.",
-                    'severity': "Critical",
-                    'timestamp': timezone.now().isoformat(),
-                    'is_dismissed': False,
-                    'is_resolved': False
-                }
-                FirestoreService.create_document('alerts', alert_data)
-            
-            docs = FirestoreService.collection('patients').limit(limit).stream()
-            return [doc.to_dict() | {'id': doc.id} for doc in docs]
+        # Helper to get wound count for a list of patients
+        def enrich_patients(patients_list):
+            for p in patients_list:
+                p_id = p.get('id')
+                # Count unique wound locations in assessments
+                assessments = FirestoreService.collection('assessments').where('patient_id', '==', p_id).stream()
+                unique_wounds = set()
+                for ass_doc in assessments:
+                    ass_data = ass_doc.to_dict()
+                    loc = ass_data.get('wound') or ass_data.get('location') or 'General'
+                    unique_wounds.add(loc)
+                p['active_wounds'] = len(unique_wounds)
+            return patients_list
 
         # Nurses see patients assigned to them via tasks by default
-        if user.role == 'Nurse':
-            # Limit tasks fetch to only what's needed for current patient list
+        if hasattr(user, 'role') and user.role == 'Nurse':
             tasks = FirestoreService.collection('tasks').where('assigned_to_id', '==', user.id).limit(limit).stream()
             patient_ids = list(set([t.to_dict().get('patient_id') for t in tasks]))
             patients = []
@@ -74,24 +78,85 @@ class PatientViewSet(viewsets.ModelViewSet):
                 p = FirestoreService.get_document('patients', p_id)
                 if p:
                     patients.append(p | {'id': p_id})
-            return patients
+            return enrich_patients(patients)
         
-        # Doctors and Admins see all (capped at 20 for extreme read reduction)
+        # Doctors and Admins see all
         docs = FirestoreService.collection('patients').limit(limit).stream()
-        return [doc.to_dict() | {'id': doc.id} for doc in docs]
+        all_patients = [doc.to_dict() | {'id': doc.id} for doc in docs]
+        return enrich_patients(all_patients)
 
     def list(self, request, *args, **kwargs):
         # Override list to handle list of dicts instead of queryset
         queryset = self.get_queryset()
         return Response(queryset)
 
-    def retrieve(self, request, *args, **kwargs):
-        patient = FirestoreService.get_document('patients', kwargs['pk'])
-        if patient:
-            return Response(patient | {'id': kwargs['pk']})
-        return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        
+        # Security/Sync: Ensure the assigned physician exists locally
+        # This prevents 400 errors for "Invalid pk" if the doctor hasn't logged in yet.
+        phys_id = data.get('assigned_physician')
+        if phys_id:
+            from users.models import User
+            if not User.objects.filter(id=phys_id).exists():
+                doc = FirestoreService.get_document('users', phys_id)
+                if doc:
+                    User.objects.create(
+                        id=phys_id,
+                        email=doc.get('email', f"sync_{phys_id}@system.local"),
+                        name=doc.get('name', 'Medical Staff'),
+                        role=doc.get('role', 'Doctor'),
+                        isActive=doc.get('isActive', True)
+                    )
+
+        serializer = self.get_serializer(data=data)
+        if not serializer.is_valid():
+            print("--- VALIDATION ERROR ---")
+            print(serializer.errors)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        return super().create(request, *args, **kwargs)
+
+    def retrieve(self, request, pk=None):
+        patient_id = pk
+        patient = FirestoreService.get_document('patients', patient_id)
+        if not patient:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Deep Fetch: History and Assessments
+        history_docs = FirestoreService.collection('clinical_records').where('patient_id', '==', patient_id).stream()
+        clinical_history = [doc.to_dict() | {'id': doc.id} for doc in history_docs]
+        clinical_history.sort(key=lambda x: x.get('recorded_at', ''), reverse=True)
+
+        assessment_docs = FirestoreService.collection('assessments').where('patient_id', '==', patient_id).stream()
+        assessments = [doc.to_dict() | {'id': doc.id} for doc in assessment_docs]
+        assessments.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+
+        # Group assessments by wound location (for compatibility with existing UI)
+        wounds_map = {}
+        for ass in assessments:
+            loc = ass.get('wound') or ass.get('location') or 'General'
+            if loc not in wounds_map:
+                wounds_map[loc] = {
+                    'id': f"w_{loc.lower().replace(' ', '_')}",
+                    'location': loc,
+                    'assessments': []
+                }
+            wounds_map[loc]['assessments'].append(ass)
+        
+        return Response(patient | {
+            'id': patient_id,
+            'clinical_history': clinical_history,
+            'wounds': list(wounds_map.values())
+        })
 
     def perform_create(self, serializer):
+        user = self.request.user
+        # Forbidden: Nurses cannot create patients
+        if hasattr(user, 'role') and user.role == 'Nurse':
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Nurses are not authorized to create patient records.")
+
         # Generate Firestore ID first so they match
         doc_ref = FirestoreService.collection('patients').document()
         firestore_id = doc_ref.id
@@ -149,6 +214,198 @@ class PatientViewSet(viewsets.ModelViewSet):
                 'assigned_at': timezone.now().isoformat()
             }
             FirestoreService.create_document('tasks', task_data)
+
+
+class AssessmentViewSet(viewsets.ViewSet):
+    """
+    Firestore-backed assessment listing/detail with role-aware access.
+    """
+    def _get_role_scope(self, request):
+        role = getattr(request.user, 'role', None)
+        user_id = request.user.id
+
+        doctor_patient_ids = set()
+        nurse_patient_ids = set()
+
+        if role == 'Doctor':
+            doctor_patients = FirestoreService.query('patients', 'assigned_physician_id', '==', user_id)
+            doctor_patient_ids = {p.get('id') for p in doctor_patients if p.get('id')}
+        elif role == 'Nurse':
+            tasks = FirestoreService.query('tasks', 'assigned_to_id', '==', user_id)
+            nurse_patient_ids = {t.get('patient_id') for t in tasks if t.get('patient_id')}
+
+        return role, user_id, doctor_patient_ids, nurse_patient_ids
+
+    def _has_access(self, role, user_id, assessment, doctor_patient_ids, nurse_patient_ids):
+        if role == 'Admin':
+            return True
+
+        patient_id = assessment.get('patient_id')
+
+        if role == 'Doctor':
+            return patient_id in doctor_patient_ids
+
+        if role == 'Nurse':
+            created_by_id = assessment.get('created_by_id')
+            nurse_id = assessment.get('nurse_id')
+            return (
+                created_by_id == user_id or
+                nurse_id == user_id or
+                patient_id in nurse_patient_ids
+            )
+
+        return False
+
+    def list(self, request):
+        role, user_id, doctor_patient_ids, nurse_patient_ids = self._get_role_scope(request)
+        if role not in ['Admin', 'Doctor', 'Nurse']:
+            return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        search = (request.query_params.get('search') or '').strip().lower()
+        status_filter = (request.query_params.get('status') or 'All Statuses').strip()
+        start_date = (request.query_params.get('start_date') or '').strip()
+        end_date = (request.query_params.get('end_date') or '').strip()
+
+        try:
+            page = max(1, int(request.query_params.get('page', 1)))
+        except ValueError:
+            page = 1
+        try:
+            page_size = int(request.query_params.get('page_size', 10))
+        except ValueError:
+            page_size = 10
+        page_size = min(max(1, page_size), 50)
+
+        start_dt = _parse_iso_datetime(f"{start_date}T00:00:00+00:00") if start_date else None
+        end_dt = _parse_iso_datetime(f"{end_date}T23:59:59+00:00") if end_date else None
+        if start_dt and end_dt and start_dt > end_dt:
+            return Response(
+                {"error": "Invalid date range: start_date cannot be after end_date."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        assessments_docs = FirestoreService.collection('assessments').stream()
+        scoped = []
+        patient_ids = set()
+
+        for doc in assessments_docs:
+            data = doc.to_dict() | {'id': doc.id}
+            if not self._has_access(role, user_id, data, doctor_patient_ids, nurse_patient_ids):
+                continue
+            p_id = data.get('patient_id')
+            if p_id:
+                patient_ids.add(p_id)
+            scoped.append(data)
+
+        patient_map = {}
+        for pid in patient_ids:
+            p_doc = FirestoreService.get_document('patients', pid)
+            if p_doc:
+                patient_map[pid] = p_doc
+
+        results = []
+        for row in scoped:
+            p_id = row.get('patient_id')
+            patient = patient_map.get(p_id) or {}
+
+            created_at, created_dt = _normalize_datetime_iso(row.get('created_at'))
+
+            if start_dt and created_dt and created_dt < start_dt:
+                continue
+            if end_dt and created_dt and created_dt > end_dt:
+                continue
+
+            status_data = _derive_assessment_status(row.get('stage'), row.get('is_escalated'))
+            if status_filter not in ['', 'All Statuses'] and status_data['status'] != status_filter:
+                continue
+
+            patient_name = row.get('patient_name') or patient.get('name') or 'Unknown Patient'
+            patient_mrn = row.get('patient_mrn') or patient.get('mrn') or 'N/A'
+
+            if search:
+                searchable = f"{patient_name} {patient_mrn}".lower()
+                if search not in searchable:
+                    continue
+
+            results.append({
+                'id': row.get('id'),
+                'created_at': created_at,
+                'patient_id': p_id,
+                'patient_name': patient_name,
+                'patient_mrn': patient_mrn,
+                'wound': row.get('wound') or row.get('location') or 'General',
+                'wound_type': row.get('wound_type') or 'Other',
+                'width': row.get('width'),
+                'depth': row.get('depth'),
+                'stage': row.get('stage') or 'Unknown',
+                'is_escalated': bool(row.get('is_escalated', False)),
+                'status': status_data['status'],
+                'status_color': status_data['status_color'],
+                'status_bg': status_data['status_bg'],
+                '_sort_ts': created_dt.timestamp() if created_dt else 0,
+            })
+
+        results.sort(key=lambda x: x.get('_sort_ts', 0), reverse=True)
+        for row in results:
+            row.pop('_sort_ts', None)
+
+        total_count = len(results)
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated = results[start_idx:end_idx]
+
+        return Response({
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages,
+            'results': paginated
+        })
+
+    def retrieve(self, request, pk=None):
+        role, user_id, doctor_patient_ids, nurse_patient_ids = self._get_role_scope(request)
+        if role not in ['Admin', 'Doctor', 'Nurse']:
+            return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        assessment = FirestoreService.get_document('assessments', pk)
+        if not assessment:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not self._has_access(role, user_id, assessment, doctor_patient_ids, nurse_patient_ids):
+            return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        p_id = assessment.get('patient_id')
+        patient = FirestoreService.get_document('patients', p_id) if p_id else {}
+        status_data = _derive_assessment_status(assessment.get('stage'), assessment.get('is_escalated'))
+
+        created_at, _ = _normalize_datetime_iso(assessment.get('created_at'))
+
+        return Response({
+            'id': pk,
+            'created_at': created_at,
+            'patient_id': p_id,
+            'patient_name': assessment.get('patient_name') or patient.get('name') or 'Unknown Patient',
+            'patient_mrn': assessment.get('patient_mrn') or patient.get('mrn') or 'N/A',
+            'wound': assessment.get('wound') or assessment.get('location') or 'General',
+            'wound_type': assessment.get('wound_type') or 'Other',
+            'width': assessment.get('width'),
+            'depth': assessment.get('depth'),
+            'stage': assessment.get('stage') or 'Unknown',
+            'is_escalated': bool(assessment.get('is_escalated', False)),
+            'status': status_data['status'],
+            'status_color': status_data['status_color'],
+            'status_bg': status_data['status_bg'],
+            'image': assessment.get('image'),
+            'notes': assessment.get('notes', ''),
+            'created_by_id': assessment.get('created_by_id'),
+            'created_by_name': assessment.get('created_by_name'),
+            'created_by_role': assessment.get('created_by_role'),
+            'nurse_id': assessment.get('nurse_id'),
+            'doctor_id': assessment.get('doctor_id'),
+        })
+
 
 class AlertViewSet(viewsets.ViewSet):
     def list(self, request):
@@ -236,11 +493,17 @@ class DoctorDashboardStatsView(APIView):
         active_patients = len(patients)
         patient_ids = [p['id'] for p in patients]
 
-        # COUNT-based task query (no streaming)
-        pending_tasks = FirestoreService.count('tasks', [
+        # COUNT-based task query: Inbound and Outbound
+        # Firestore query doesn't support 'OR' easily without multiple reads, so we'll sum them
+        inbound_tasks = FirestoreService.count('tasks', [
+            ('status', '==', 'PENDING'),
+            ('assigned_to_id', '==', user_id)
+        ])
+        outbound_tasks = FirestoreService.count('tasks', [
             ('status', '==', 'PENDING'),
             ('assigned_by_id', '==', user_id)
         ])
+        pending_tasks = inbound_tasks + outbound_tasks
 
         # COUNT-based scans for today — single aggregation read
         today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -266,25 +529,41 @@ class DoctorScheduledTasksView(APIView):
         if cached:
             return Response(cached)
 
-        # Direct query by assigned_by_id — no stream needed
-        # Tasks assigned BY this doctor, that are still PENDING
-        tasks_raw = FirestoreService.query('tasks', 'assigned_by_id', '==', user_id)
-
-        # Fetch patients once for name lookup (already cheap — limited set)
-        patients = FirestoreService.query('patients', 'assigned_physician_id', '==', user_id)
-        patient_map = {p['id']: p for p in patients}
+        # Query tasks assigned TO the doctor OR assigned BY them
+        # We query both separately and merge for quota efficiency and simplicity
+        inbound = FirestoreService.query('tasks', 'assigned_to_id', '==', user_id)
+        outbound = FirestoreService.query('tasks', 'assigned_by_id', '==', user_id)
+        
+        # Merge and dedup if someone assigned a task to themselves
+        seen_ids = set()
+        tasks_raw = []
+        
+        for t in inbound:
+            if t.get('id') not in seen_ids:
+                t['assignment_type'] = 'DIRECT'
+                tasks_raw.append(t)
+                seen_ids.add(t.get('id'))
+                
+        for t in outbound:
+            if t.get('id') not in seen_ids:
+                t['assignment_type'] = 'DELEGATED'
+                tasks_raw.append(t)
+                seen_ids.add(t.get('id'))
 
         tasks = []
         for t in tasks_raw:
             if t.get('status') != 'PENDING':
                 continue
-            p_id = t.get('patient_id', '')
-            patient = patient_map.get(p_id)
+                
+            patient_name = t.get('patient_name', 'Unknown Patient')
+            bed = t.get('bed_number') or 'N/A'
+            
             tasks.append({
                 'id': t.get('id', ''),
                 'time': t.get('due_time'),
                 'title': t.get('title'),
-                'description': f"Patient: {patient.get('name') if patient else 'Unknown'} • Bed {patient.get('bed', 'N/A') if patient else 'N/A'}"
+                'assignment_type': t.get('assignment_type'),
+                'description': f"Patient: {patient_name} • Bed {bed}"
             })
 
         tasks.sort(key=lambda x: x.get('time') or '')
@@ -395,9 +674,11 @@ class DoctorTaskViewSet(viewsets.ViewSet):
             task_payload = {
                 'patient_id': data['patient'],
                 'patient_name': patient_doc.get('name', 'Unknown Patient') if patient_doc else 'Unknown Patient',
+                'bed_number': patient_doc.get('bed', 'N/A') if patient_doc else 'N/A',
                 'assigned_to_id': data['assigned_to'],
                 'assigned_to_name': nurse_doc.get('name', 'Nurse') if nurse_doc else 'Nurse',
                 'title': data['title'],
+                'task_type': data.get('task_type', 'GEN').upper(), # New field for dynamic actions
                 'due_time': data['due_time'],
                 'priority': data.get('priority', 'medium').upper(),
                 'status': 'PENDING',
@@ -490,6 +771,8 @@ class NurseTaskViewSet(viewsets.ViewSet):
                 task['patient_name'] = 'See Patient Record'
             if not task.get('assigned_to_name'):
                 task['assigned_to_name'] = task.get('assigned_to_id', 'Nurse')
+            if not task.get('task_type'):
+                task['task_type'] = 'GEN'
 
         cache.set(cache_key, tasks, ttl_seconds=120)  # Cache 2 min
         return Response(tasks)
@@ -519,9 +802,16 @@ class NurseClinicalViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'], url_path='upload-wound')
     def upload_wound(self, request):
         user_id = request.user.id
+        user_role = getattr(request.user, 'role', None)
         patient_id = request.data.get('patient')
         image = request.FILES.get('image')
         notes = request.data.get('notes', '')
+
+        if user_role not in ['Nurse', 'Doctor']:
+            return Response(
+                {"error": "Only Nurse or Doctor roles can upload wound assessments."},
+                status=status.HTTP_403_FORBIDDEN
+            )
         
         # Check if patient exists in Firestore
         patient = FirestoreService.get_document('patients', patient_id)
@@ -548,9 +838,14 @@ class NurseClinicalViewSet(viewsets.ViewSet):
         stage = random.choice(['Stage 1', 'Stage 2', 'Stage 3'])
         
         # Save assessment to Firestore
+        creator_key = 'nurse_id' if user_role == 'Nurse' else 'doctor_id'
         assessment_data = {
-            'nurse_id': user_id,
+            creator_key: user_id,
+            'created_by_id': user_id,
+            'created_by_name': getattr(request.user, 'name', None),
+            'created_by_role': user_role,
             'patient_id': patient_id,
+            'patient_name': patient.get('name'),
             'image': base64_image_uri,
             'notes': notes,
             'width': width,
@@ -598,7 +893,13 @@ class NurseClinicalViewSet(viewsets.ViewSet):
             }
             FirestoreService.create_document('alerts', alert_data)
 
-        return Response(assessment_data | {'id': assessment_id}, status=status.HTTP_201_CREATED)
+        # Backward-compatible aliases for existing frontend modal labels
+        response_payload = assessment_data | {
+            'id': assessment_id,
+            'nurse_name': getattr(request.user, 'name', None),
+        }
+
+        return Response(response_payload, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['post'], url_path='record-vitals')
     def record_vitals(self, request):
@@ -611,6 +912,7 @@ class NurseClinicalViewSet(viewsets.ViewSet):
         data = {
             'patient_id': patient_id,
             'recorded_by_id': request.user.id,
+            'nurse_name': getattr(request.user, 'name', 'Staff'), # For easy display in history
             'heart_rate': request.data.get('heart_rate'),
             'respiratory_rate': request.data.get('respiratory_rate'),
             'oxygen_saturation': request.data.get('oxygen_saturation'),

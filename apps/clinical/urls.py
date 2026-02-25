@@ -2,6 +2,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     PatientViewSet,
+    AssessmentViewSet,
     AlertViewSet, 
     AlertStatsView, 
     DoctorDashboardSummaryView, 
@@ -16,6 +17,7 @@ from .views import (
 
 router = DefaultRouter()
 router.register(r'patients', PatientViewSet, basename='patient')
+router.register(r'assessments', AssessmentViewSet, basename='assessment')
 router.register(r'alerts', AlertViewSet, basename='alert')
 router.register(r'doctor/tasks', DoctorTaskViewSet, basename='doctor-tasks')
 router.register(r'nurse/tasks', NurseTaskViewSet, basename='nurse-tasks')
