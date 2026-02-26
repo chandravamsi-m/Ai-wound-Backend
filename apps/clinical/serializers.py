@@ -10,6 +10,8 @@ class ClinicalRecordSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'patient', 'patient_name', 'recorded_by', 'nurse_name',
             'heart_rate', 'respiratory_rate', 'oxygen_saturation', 
+            'blood_pressure_systolic', 'blood_pressure_diastolic', 
+            'temperature', 'weight', 'height', 'bmi',
             'nurse_notes', 'recorded_at'
         ]
         read_only_fields = ['id', 'recorded_by', 'recorded_at']
@@ -23,8 +25,11 @@ class WoundAssessmentSerializer(serializers.ModelSerializer):
         model = WoundAssessment
         fields = [
             'id', 'wound', 'wound_location', 'patient_name', 
-            'nurse', 'nurse_name', 'image', 'width', 'depth', 
-            'stage', 'notes', 'is_escalated', 'created_at'
+            'nurse', 'nurse_name', 'image', 'width', 'depth', 'length',
+            'stage', 'exudate_amount', 'pain_level', 'notes', 
+            'ml_analysis_result', 'cure_recommendation', 'reduction_rate',
+            'confidence_score', 'healing_index', 'algorithm_analysis',
+            'is_escalated', 'created_at'
         ]
         read_only_fields = ['id', 'nurse', 'created_at', 'is_escalated']
 
@@ -33,7 +38,7 @@ class WoundSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Wound
-        fields = ['id', 'patient', 'location', 'created_at', 'assessments']
+        fields = ['id', 'patient', 'location', 'wound_type', 'onset_date', 'created_at', 'assessments']
         read_only_fields = ['id']
 
 class PatientSerializer(serializers.ModelSerializer):
@@ -49,7 +54,10 @@ class PatientSerializer(serializers.ModelSerializer):
             'id', 'name', 'mrn', 'age', 'gender', 'date_of_birth', 
             'bed', 'ward', 'assigned_physician', 'physician_name', 
             'diagnosis', 'medical_history', 'admission_date', 
-            'status', 'clinical_history', 'wounds'
+            'status', 'contact_number', 'address', 
+            'emergency_contact_name', 'emergency_contact_number',
+            'diabetes_type', 'allergies', 'blood_group',
+            'clinical_history', 'wounds'
         ]
         read_only_fields = ['id', 'mrn']
 

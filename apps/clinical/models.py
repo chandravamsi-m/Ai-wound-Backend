@@ -23,10 +23,27 @@ class Patient(models.Model):
         blank=True, 
         related_name='patients_under_care'
     )
+    assigned_nurse = models.ForeignKey(
+        settings.AUTH_USER_MODEL, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True, 
+        related_name='patients_under_nurse_care'
+    )
     diagnosis = models.TextField(null=True, blank=True)
     medical_history = models.TextField(null=True, blank=True)
     admission_date = models.DateTimeField(default=timezone.now)
     
+    # [NEW] Contact & Clinical Details
+    contact_number = models.CharField(max_length=20, blank=True, null=True)
+    address = models.TextField(blank=True, null=True)
+    emergency_contact_name = models.CharField(max_length=100, blank=True, null=True)
+    emergency_contact_number = models.CharField(max_length=20, blank=True, null=True)
+    
+    diabetes_type = models.CharField(max_length=100, blank=True, null=True)
+    allergies = models.TextField(blank=True, null=True)
+    blood_group = models.CharField(max_length=10, blank=True, null=True)
+
     STATUS_CHOICES = [
         ('Stable', 'Stable'),
         ('Observation', 'Observation'),
@@ -63,6 +80,7 @@ class Wound(models.Model):
     patient = models.ForeignKey(Patient, related_name='wounds', on_delete=models.CASCADE)
     location = models.CharField(max_length=200, default="General")
     wound_type = models.CharField(max_length=50, choices=WOUND_TYPES, default='Other')
+    onset_date = models.DateField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
     
     def __str__(self):
@@ -76,8 +94,20 @@ class WoundAssessment(models.Model):
     
     width = models.FloatField(help_text="Width in cm")
     depth = models.FloatField(help_text="Depth in cm")
+    length = models.FloatField(null=True, blank=True, help_text="Length in cm")
     stage = models.CharField(max_length=50) # e.g. "Stage 2"
     
+    exudate_amount = models.CharField(max_length=100, blank=True, null=True)
+    pain_level = models.IntegerField(default=0)
+    
+    # AI/ML Analysis Results
+    ml_analysis_result = models.JSONField(null=True, blank=True)
+    cure_recommendation = models.TextField(blank=True, null=True)
+    reduction_rate = models.FloatField(null=True, blank=True)
+    confidence_score = models.FloatField(null=True, blank=True)
+    healing_index = models.FloatField(null=True, blank=True)
+    algorithm_analysis = models.JSONField(null=True, blank=True)
+
     notes = models.TextField(blank=True)
     is_escalated = models.BooleanField(default=False)
     created_at = models.DateTimeField(default=timezone.now)
@@ -113,9 +143,20 @@ class ClinicalRecord(models.Model):
     id = models.CharField(max_length=255, primary_key=True)
     patient = models.ForeignKey(Patient, related_name='clinical_records', on_delete=models.CASCADE)
     recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    
+    # Core Vitals
     heart_rate = models.IntegerField(null=True, blank=True)
     respiratory_rate = models.IntegerField(null=True, blank=True)
     oxygen_saturation = models.IntegerField(null=True, blank=True)
+    blood_pressure_systolic = models.IntegerField(null=True, blank=True)
+    blood_pressure_diastolic = models.IntegerField(null=True, blank=True)
+    temperature = models.FloatField(null=True, blank=True)
+    
+    # Morphology
+    weight = models.FloatField(null=True, blank=True) # in kg
+    height = models.FloatField(null=True, blank=True) # in cm
+    bmi = models.FloatField(null=True, blank=True)
+    
     nurse_notes = models.TextField(blank=True)
     recorded_at = models.DateTimeField(default=timezone.now)
 
